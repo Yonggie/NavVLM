@@ -1,0 +1,9 @@
+[submodule "third_party/SuperGluePretrainedNetwork"]
+	path = third_party/SuperGluePretrainedNetwork
+	url = https://github.com/magicleap/SuperGluePretrainedNetwork.git
+[submodule "perception/detection/grounded_sam"]
+	path = perception/detection/grounded_sam
+	url = https://github.com/IDEA-Research/Grounded-Segment-Anything.git
+[submodule "perception/detection/detic/Detic"]
+	path = perception/detection/detic/Detic
+	url = https://github.com/facebookresearch/Detic.git
