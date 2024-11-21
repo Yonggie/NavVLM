@@ -937,6 +937,7 @@ class NavWithLLM():
                 action='turn_right'
             else:
                 print('frontier planning')
+                goal_map=self.frontier_goal_map()
                 action, stg_reached = self._plan(obstacle_map,
                                                     goal_map,
                                                     self.planner_pose_inputs[e])
