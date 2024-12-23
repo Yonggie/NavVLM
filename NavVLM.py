@@ -1,3 +1,4 @@
+import random
 from navi_config import NaviConfig
 import json
 from load_sim_utils import sim_settings,make_cfg
@@ -41,15 +42,14 @@ import cv2
 import habitat_sim
 from perception.detection.detic.detic_perception import DeticPerception
 
-
+vlm_model='openbmb/MiniCPM-V-2_6'
 class NavWithLLM():
     def __init__(self,
                 sim,
-                 device_id: int = 0):
+                 device_id=NaviConfig.GPU_ID):
         super().__init__()
         self.llm_goal_start=999
-        self.should_stop_accumulation=0
-        self.last_stop_time = None
+        self.history_buffer=[]
 
         self.use_llm=True
         # used in update map
@@ -58,10 +58,10 @@ class NavWithLLM():
         self.look_around_max_step=360/NaviConfig.ENVIRONMENT.turn_angle
         self.look_around_step=0
 
-        self.llm = AutoModel.from_pretrained('openbmb/MiniCPM-Llama3-V-2_5', trust_remote_code=True, torch_dtype=torch.float16)
-        self.llm = self.llm.to(device=f'cuda:{NaviConfig.GPU_ID}')
+        self.llm = AutoModel.from_pretrained(vlm_model, trust_remote_code=True, torch_dtype=torch.float16)
+        self.llm = self.llm.to(device=f'cuda:{device_id}')
 
-        self.tokenizer = AutoTokenizer.from_pretrained('openbmb/MiniCPM-Llama3-V-2_5', trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(vlm_model, trust_remote_code=True)
         self.llm.eval()
 
         self.device_id = device_id
@@ -75,21 +75,18 @@ class NavWithLLM():
                                             NaviConfig.ENVIRONMENT.turn_angle)
         else:
             self.panorama_start_steps = 0
-        self.panorama_rotate_steps = int(360 / NaviConfig.ENVIRONMENT.turn_angle)
 
         self.segmentation = DeticPerception(vocabulary="coco", sem_gpu_id=device_id)
         self.cate_id_to_name = self.segmentation.category_id_to_name                  
         
-        self.num_environments = NaviConfig.NUM_ENVIRONMENTS
-        self.num_scenes = self.num_environments
+        self.num_env = NaviConfig.NUM_ENVIRONMENTS
         self.num_sem_categories = len(self.segmentation.categories_mapping)
         
-
 
         self.record_instance_ids = NaviConfig.SEMANTIC_MAP.record_instance_ids
         if self.record_instance_ids:
             self.instance_memory = InstanceMemory(
-                self.num_environments,
+                self.num_env,
                 NaviConfig.SEMANTIC_MAP.du_scale,
                 debug_visualize=NaviConfig.visualize,
                 config=NaviConfig,
@@ -99,7 +96,7 @@ class NavWithLLM():
 
         self.goal_policy_config = NaviConfig.SUPERGLUE
         self.matching = GoatMatching(
-            device=device_id,
+            device=NaviConfig.GPU_ID,
             score_func=self.goal_policy_config.score_function,
             num_sem_categories=self.num_sem_categories,
             config=NaviConfig.SUPERGLUE,
@@ -116,65 +113,19 @@ class NavWithLLM():
         self.expand2multi_binary = torch.eye(
             NaviConfig.SEMANTIC_MAP.num_sem_categories, device=self.device)
 
-        self.sub_task_timesteps = None
-        self.total_timesteps = None
-        self.episode_panorama_start_steps = None
-        self.reached_goal_panorama_rotate_steps = self.panorama_rotate_steps
 
-        
-        
-
-        self.goal_image = None
-        self.goal_mask = None
-        self.goal_image_keypoints = None
-
-        self.found_goal = torch.zeros(self.num_environments,
-                                      1,
-                                      dtype=bool,
-                                      device=self.device)
-
-        
-
-
-        '''Parameters from module'''
         self.policy = DummyPolicy(
             exploration_strategy=NaviConfig.AGENT.exploration_strategy,
             device_id=self.device_id)
-        self.goal_update_steps = self.policy.goal_update_steps
-        self.goal_policy_config = NaviConfig.SUPERGLUE
 
-        '''Parameters from map'''
-        self.last_pose = None
-
-        ''' Parameters for path planning '''
-        self.stop = None
-
-        ''' Parameters from map dev '''
-        # --- Env Parameters
-        self.last_sim_location = None
-        self.goal_name = 'Testing'
         
-        map_shape = (self.args.SEMANTIC_MAP.map_size_cm // self.args.SEMANTIC_MAP.map_resolution,
-                     self.args.SEMANTIC_MAP.map_size_cm // self.args.SEMANTIC_MAP.map_resolution)
-        self.collision_map = np.zeros(map_shape)
-        self.visited = np.zeros(map_shape)
-        self.visited_vis = np.zeros(map_shape)
 
-        self.last_loc = None
-        self.curr_loc = [self.args.SEMANTIC_MAP.map_size_cm / 100.0 / 2.0,
-                         self.args.SEMANTIC_MAP.map_size_cm / 100.0 / 2.0, 0.]
-        
-        self.last_action = None
-        self.col_width = None
-        self.selem = skimage.morphology.disk(3)
-
-        # --- Map Parameters ---
-        self.res = transforms.Compose(
+        # --- visualization Parameters ---
+        self.trans = transforms.Compose(
             [transforms.ToPILImage(),
              transforms.Resize((self.args.ENVIRONMENT.frame_height, self.args.ENVIRONMENT.frame_width),
                                interpolation=Image.NEAREST)])
 
-        
         self.vis_image = None
         self.rgb_vis = None 
 
@@ -184,148 +135,100 @@ class NavWithLLM():
         if self.args.SEMANTIC_MAP.record_instance_ids:
             self.nc += self.args.SEMANTIC_MAP.num_sem_categories
             
-
-        # Calculating full and local map sizes
+        '''Parameters from slam'''
+        self.last_pose = None
+        self.last_sim_location = None
+        
         map_size = self.args.SEMANTIC_MAP.map_size_cm // self.args.SEMANTIC_MAP.map_resolution
         self.full_w, self.full_h = map_size, map_size
+        self.map_shape = (self.full_w, self.full_h)
+        self.collision_map = np.zeros(self.map_shape)
+        self.visited = np.zeros(self.map_shape)
+        self.visited_vis = np.zeros(self.map_shape)
+
+        self.last_loc = None
+        self.center_loc = [self.args.SEMANTIC_MAP.map_size_cm / 100.0 / 2.0,
+                         self.args.SEMANTIC_MAP.map_size_cm / 100.0 / 2.0, 0.]
+        
+        self.last_action = None
+        self.col_width = None
+        self.selem = skimage.morphology.disk(3)
+
+
+        # Calculating full and local map sizes
         self.local_w = int(self.full_w / self.args.SEMANTIC_MAP.global_downscaling)
         self.local_h = int(self.full_h / self.args.SEMANTIC_MAP.global_downscaling)
 
         # Initializing full and local map
-        self.full_map = torch.zeros(self.num_scenes, self.nc, self.full_w, self.full_h).float().to(self.device)
-        self.local_map = torch.zeros(self.num_scenes, self.nc, self.local_w,
+        self.full_map = torch.zeros(self.num_env, self.nc, self.full_w, self.full_h).float().to(self.device)
+        self.local_map = torch.zeros(self.num_env, self.nc, self.local_w,
                                 self.local_h).float().to(self.device)
 
         # Initial full and local pose
-        self.full_pose = torch.zeros(self.num_scenes, 3).float().to(self.device)
-        self.local_pose = torch.zeros(self.num_scenes, 3).float().to(self.device)
+        self.full_pose = torch.zeros(self.num_env, 3).float().to(self.device)
+        self.local_pose = torch.zeros(self.num_env, 3).float().to(self.device)
 
 
-        # Origin of local map
-        self.origins = np.zeros((self.num_scenes, 3))
+        # Origin of local map, in meter
+        self.origins = np.zeros((self.num_env, 3))
 
-        # Local Map Boundaries
-        self.lmb = np.zeros((self.num_scenes, 4)).astype(int)
+        # Local Map Boundaries, in centimeter.  
+        # everything local is centimeter, everything global(full) is meter
+        self.lmb = np.zeros((self.num_env, 4)).astype(int)
 
         # Planner pose inputs has 7 dimensions
         # 1-3 store continuous global agent location
         # 4-7 store local map boundaries
-        self.planner_pose_inputs = np.zeros((self.num_scenes, 7))
+        self.planner_pose_inputs = np.zeros((self.num_env, 7))
 
         map_features_channels = 2 * MC.NON_SEM_CHANNELS + self.num_sem_categories
         if self.record_instance_ids:
             map_features_channels += self.num_sem_categories
         self.map_features = torch.zeros(
-            self.num_scenes,
+            self.num_env,
             map_features_channels,
             self.local_w,
             self.local_h,
             device=self.device,
         ).float()
 
-        self.goal_map = torch.zeros(
-            self.num_environments,
-            1,
-            *self.local_map.shape[2:],
-            device=self.device,
-        )
 
-        self.frontier_map = torch.zeros(
-            self.num_environments, 
-            *self.local_map.shape[2:],
-            device=self.device
-        )
-
-        self.semantic_goal_map = torch.zeros(
-            self.num_environments, 
-            *self.local_map.shape[2:],
-            device=self.device
-        )
 
         self.sem_map_module = SemanticMappingClean(self.instance_memory, device=self.device).to(self.device)
         self.sem_map_module.eval() 
         
         
-        
-
-
-
-    def reset_vectorized(self):
-        """Initialize agent state."""
-        self.total_timesteps = [0] * self.num_environments
-        
-
-
-        # self.instance_map.init_instance_map()
-        self.episode_panorama_start_steps = self.panorama_start_steps
-        self.reached_goal_panorama_rotate_steps = self.panorama_rotate_steps
-        if self.instance_memory is not None:
-            self.instance_memory.reset()
-        
-        
-
-
-        self.goal_image = None
-        self.goal_mask = None
-        self.goal_image_keypoints = None
-
-        self.found_goal[:] = False
-        self.goal_map[:] *= 0
-
-
-        self.init_map_and_pose()
 
     def reset(self,tgt):
         """Initialize agent state."""
+        self.time_step=0
         self.llm_goal_start=999
-        self.last_stop_time=None
-        self.should_stop_accumulation=0
         self.llm_last_goal_map=None
         self.last_sim_location=self.get_curr_pose()
 
-        self.reset_vectorized()
-        self.goal_image = None
-        self.goal_mask = None
-        self.goal_image_keypoints = None
+        if self.instance_memory is not None:
+            self.instance_memory.reset()
+        self.init_map_and_pose()
+        
+        
         
         if self.args.visualize or self.args.save_images:
             self.vis_image = vu.init_vis_image(tgt, None)
         
         # from env parameters
-        map_shape = (self.args.SEMANTIC_MAP.map_size_cm // self.args.SEMANTIC_MAP.map_resolution,
-                     self.args.SEMANTIC_MAP.map_size_cm // self.args.SEMANTIC_MAP.map_resolution)
-        self.collision_map = np.zeros(map_shape)
-        self.visited = np.zeros(map_shape)
-        self.visited_vis = np.zeros(map_shape)
-        self.curr_loc = [self.args.SEMANTIC_MAP.map_size_cm / 100.0 / 2.0,
-                         self.args.SEMANTIC_MAP.map_size_cm / 100.0 / 2.0, 0.]
+        self.collision_map = np.zeros(self.map_shape)
+        self.visited = np.zeros(self.map_shape)
+        self.visited_vis = np.zeros(self.map_shape)
+        # init loc in the center of the map
+        self.curr_loc = self.center_loc
         self.last_action = None
         self.col_width = 1
         
 
-    def reset_sub_episode(self) -> None:
+    def reset_timestep(self) -> None:
         """Reset for a new sub-episode since pre-processing is temporally dependent."""
-        self.total_timesteps[0]=0
+        self.time_step=0
 
-        self.goal_image = None
-        self.goal_image_keypoints = None
-        self.goal_mask = None
-
-    
-    def reset_vectorized_for_env(self, e: int):
-        """Initialize agent state for a specific environment."""
-        self.total_timesteps[e] = 0
-        self.sub_task_timesteps[e] = [0] * self.max_num_sub_task_episodes
-
-        # self.semantic_map.init_map_and_pose_for_env(e)
-        self.episode_panorama_start_steps = self.panorama_start_steps
-        self.reached_goal_panorama_rotate_steps = self.panorama_rotate_steps
-        if self.instance_memory is not None:
-            self.instance_memory.reset_for_env(e)
-
-        self.goal_image = None
-        self.goal_image_keypoints = None
-        self.goal_mask = None
 
 
     def get_curr_pose(self):
@@ -387,7 +290,7 @@ class NavWithLLM():
 
         locs = self.full_pose.cpu().numpy()
         self.planner_pose_inputs[:, :3] = locs
-        for e in range(self.num_scenes):
+        for e in range(self.num_env):
             r, c = locs[e, 1], locs[e, 0]
             loc_r, loc_c = [int(r * 100.0 / self.args.SEMANTIC_MAP.map_resolution),
                             int(c * 100.0 / self.args.SEMANTIC_MAP.map_resolution)]
@@ -402,7 +305,7 @@ class NavWithLLM():
             self.origins[e] = [self.lmb[e][2] * self.args.SEMANTIC_MAP.map_resolution / 100.0,
                           self.lmb[e][0] * self.args.SEMANTIC_MAP.map_resolution / 100.0, 0.]
 
-        for e in range(self.num_scenes):
+        for e in range(self.num_env):
             self.local_map[e] = self.full_map[e, :,
                                     self.lmb[e, 0]:self.lmb[e, 1],
                                     self.lmb[e, 2]:self.lmb[e, 3]]
@@ -440,7 +343,7 @@ class NavWithLLM():
         self.local_map[:, 2, :, :].fill_(0.)  # Resetting current location channel
 
         # Update global map, origins, lmb
-        for e in range(self.num_scenes):
+        for e in range(self.num_env):
             r, c = locs[e, 1], locs[e, 0] # y, x
             loc_r, loc_c = [int(r * 100.0 / self.args.SEMANTIC_MAP.map_resolution),
                             int(c * 100.0 / self.args.SEMANTIC_MAP.map_resolution)]
@@ -494,10 +397,8 @@ class NavWithLLM():
     
    
     def should_stop(self,image,tgt):
-        if tgt=='toilet':
-            question = f'Is there {tgt} in the image? yes or no'
-        else:
-            question = f'is {tgt} in the foreground of the image? yes or no'
+        
+        question = f'is {tgt} in the near foreground of the image? yes or no'
 
         image=Image.fromarray(image,'RGB')
         answer=self.llm_speak(image,question)
@@ -510,27 +411,27 @@ class NavWithLLM():
     
 
     
-    def _plan(self, map_pred,goal,curr_pose):
+    def _plan(self, obstacle_map,goal,local_pose_and_lmb):
         """Function responsible for planning
 
         Args:
             
-            'map_pred'  (ndarray): (M, M) map prediction
+            'obstacle_map'  (ndarray): (M, M) map prediction
             'goal'      (ndarray): (M, M) goal locations
-            'curr_pose' (ndarray): (7,) array  denoting pose (x,y,o)
-                            and planning window (gx1, gx2, gy1, gy2)
+            'local_pose_and_lmb' (ndarray): (7,) array  denoting pose (x,y,o) in meter
+                            and planning window (gx1, gx2, gy1, gy2) in centimeter
 
         Returns:
-            action (int): action id
+            action (str): action 
         """
         args = self.args
         self.last_loc = self.curr_loc
 
         # Get Map prediction
-        map_pred = np.rint(map_pred)
+        obstacle_map = np.rint(obstacle_map)
 
         # Get pose prediction and global policy planning window
-        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = curr_pose
+        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = local_pose_and_lmb
 
         planning_window = [gx1, gx2, gy1, gy2]
         planning_window=[int(num) for num in planning_window]
@@ -540,7 +441,7 @@ class NavWithLLM():
         r, c = start_y, start_x
         start = [int(r * 100.0 / args.SEMANTIC_MAP.map_resolution - gx1),
                  int(c * 100.0 / args.SEMANTIC_MAP.map_resolution - gy1)]
-        start = pu.threshold_poses(start, map_pred.shape)
+        start = pu.threshold_poses(start, obstacle_map.shape)
 
         self.visited[gx1:gx2, gy1:gy2][start[0] - 0:start[0] + 1,
                                        start[1] - 0:start[1] + 1] = 1
@@ -551,13 +452,12 @@ class NavWithLLM():
             r, c = last_start_y, last_start_x
             last_start = [int(r * 100.0 / args.SEMANTIC_MAP.map_resolution - gx1),
                           int(c * 100.0 / args.SEMANTIC_MAP.map_resolution - gy1)]
-            last_start = pu.threshold_poses(last_start, map_pred.shape)
+            last_start = pu.threshold_poses(last_start, obstacle_map.shape)
             self.visited_vis[gx1:gx2, gy1:gy2] = \
                 vu.draw_line(last_start, start,
                              self.visited_vis[gx1:gx2, gy1:gy2])
 
         # Collision check
-        # print('last action', self.last_action)
         if self.last_action == 'move_forward': # move forward
             x1, y1, t1 = self.last_loc
             x2, y2, _ = self.curr_loc
@@ -591,7 +491,7 @@ class NavWithLLM():
                                                     self.collision_map.shape)
                         self.collision_map[r, c] = 1
 
-        stg, stop = self._get_stg(map_pred, start, np.copy(goal),
+        stg, stop = self._get_stg(obstacle_map, start, np.copy(goal),
                                   planning_window)
         (stg_x, stg_y) = stg
         angle_st_goal = math.degrees(math.atan2(stg_x - start[0],
@@ -605,21 +505,21 @@ class NavWithLLM():
             relative_angle -= 360
 
         if relative_angle > self.args.ENVIRONMENT.turn_angle / 2.:
-            action = 'turn_right'  # Right: 3
+            action = 'turn_right' 
         elif relative_angle < -self.args.ENVIRONMENT.turn_angle / 2.:
-            action = 'turn_left'  # Left: 2
+            action = 'turn_left' 
         else:
-            action = 'move_forward'  # Forward: 1
+            action = 'move_forward' 
 
-        return action,stop
+        return action,stop,stg
 
-    def _get_stg(self, grid, start, goal, planning_window):
+    def _get_stg(self, obstacle_map, start, goal, planning_window):
         """Get short-term goal"""
 
         [gx1, gx2, gy1, gy2] = planning_window
 
         x1, y1, = 0, 0
-        x2, y2 = grid.shape
+        x2, y2 = obstacle_map.shape
 
         def add_boundary(mat, value=1):
             h, w = mat.shape
@@ -627,15 +527,13 @@ class NavWithLLM():
             new_mat[1:h + 1, 1:w + 1] = mat
             return new_mat
 
-        traversible = skimage.morphology.binary_dilation(
-            grid[x1:x2, y1:y2],
-            self.selem) != True
+        expanded_obstacle=obstacle_map
+        traversible =  (expanded_obstacle!= True).astype(int)
         traversible[self.collision_map[gx1:gx2, gy1:gy2]
                     [x1:x2, y1:y2] == 1] = 0
         traversible[self.visited[gx1:gx2, gy1:gy2][x1:x2, y1:y2] == 1] = 1
-
-        traversible[int(start[0] - x1) - 1:int(start[0] - x1) + 2,
-                    int(start[1] - y1) - 1:int(start[1] - y1) + 2] = 1
+        traversible[int(start[0]) - 1:int(start[0]) + 2,
+                    int(start[1]) - 1:int(start[1]) + 2] = 1
 
         traversible = add_boundary(traversible)
         goal = add_boundary(goal, value=0)
@@ -648,24 +546,24 @@ class NavWithLLM():
         goal = 1 - goal * 1.
         planner.set_multi_goal(goal)
 
-        state = [start[0] - x1 + 1, start[1] - y1 + 1]
-        # print('state',state)
+        state = [start[0] + 1, start[1]  + 1]
+
         stg_x, stg_y, _, stop = planner.get_short_term_goal(state)
 
-        stg_x, stg_y = stg_x + x1 - 1, stg_y + y1 - 1
+        stg_x, stg_y = stg_x  - 1, stg_y - 1
 
         return (stg_x, stg_y), stop
 
     def _visualize(self, exp_pred,pose_pred,
                    map_pred,sem_map_pred, goal_map,
-                   epi_id, tgt='test'):
+                   stg=None, tgt='test'):
         args = self.args
-        dump_dir = f"{args.DUMP_LOCATION}/{epi_id}_{tgt}"
+        dump_dir = f"{args.DUMP_LOCATION}/hm3d/{tgt}"
         if not os.path.exists(dump_dir):
             os.makedirs(dump_dir)
  
         start_x, start_y, start_o, gx1, gx2, gy1, gy2 = pose_pred
-
+        # (start_x, start_y) (12.0, 12.0)
         sem_map = sem_map_pred
 
         gx1, gx2, gy1, gy2 = int(gx1), int(gx2), int(gy1), int(gy2)
@@ -687,7 +585,11 @@ class NavWithLLM():
         sem_map[vis_mask] = 3
 
         selem = skimage.morphology.disk(4)
+        # goal_mat = 1 - skimage.morphology.binary_dilation(
+        #     goal, selem) != True
 
+        # goal_mask = goal_mat == 1
+        # sem_map[goal_mask] = 4
         
         color_pal = [int(x * 255.) for x in color_palette]
         sem_map_vis = Image.new("P", (sem_map.shape[1],
@@ -702,7 +604,7 @@ class NavWithLLM():
                                  interpolation=cv2.INTER_NEAREST)
         self.vis_image[50:530, 15:655] = self.rgb_vis
         self.vis_image[50:530, 670:1150] = sem_map_vis
-
+        
         pos = (
             (start_x * 100. / args.SEMANTIC_MAP.map_resolution - gy1)
             * 480 / map_pred.shape[0],
@@ -725,7 +627,7 @@ class NavWithLLM():
             cv2.waitKey(1)
 
         if args.save_images:
-            img_save_path=dump_dir+f'/vis-{self.total_timesteps[0]}.png'
+            img_save_path=dump_dir+f'/vis-{self.time_step}.png'
             cv2.imwrite(img_save_path, self.vis_image)
 
     def llm_speak(self,image,question):
@@ -736,20 +638,125 @@ class NavWithLLM():
                 tokenizer=self.tokenizer,
                 sampling=True,
                 temperature=0.7,
+                system_prompt='You are now a robot in the home'
             )
-            
             
         return answer.lower()
     
-    def step(self, observes: Dict, tgt,epi_id,timestep) -> str:
+    def llm_speak_multi_img(self,images,question):
+        content=images+[question]
+        answer = self.llm.chat(
+                image=None,
+                msgs=[{'role': 'user', 'content': content}],
+                tokenizer=self.tokenizer,
+                sampling=True,
+                temperature=0.7,
+                system_prompt='You are now a robot in the home, you speak neatly.' # pass system_prompt if needed
+            )
+            
+        return answer.lower()
+   
+    def is_stuck(self,xyos):
+        # o in radian
+        i=1
+        total_dist=0
+        for i in range(len(xyos)):
+            dist = np.sqrt(np.sum(np.square(xyos[i-1][:2] - xyos[i][:2])))
+            total_dist+=dist
+        if total_dist<1 and abs(xyos[0][-1]-xyos[-1][-1])<10*np.pi/180:
+            return True
+        
+    def vlm_direction(self,np_img,tgt,obs:Observations):
+        llm_guide='initialized'
+        if self.time_step==0:
+            # single
+            question = f'which direction should I go to find {tgt} based on the image? explore more, left, right or straight to the front?'
+            image=Image.fromarray(np_img,'RGB')
+            answer=self.llm_speak(image,question)
+        else:
+            # sequence
+            direction_quest=f'''The first image is your current observation.
+            In the second image, left is last step observation and right is the history trajectory topdown map. 
+            Based on the observation and history map, to find {tgt}, 
+            Which direction should you take? explore more, left, right, or go forward straight to the front? 
+            speak only the option I give you'''
+            current_obs=Image.fromarray(np_img,'RGB')
+            history_map=self.vis_image
+            answer=self.llm_speak_multi_img([current_obs,history_map],direction_quest)
+
+        print(answer+'\n')
+        def if_explore(answer):
+            if f'no {tgt}' in answer\
+                    or 'does not contain' in answer\
+                        or 'explore further' in answer \
+                        or 'explore more' in answer \
+                        or 'no direct indication' in answer\
+                        or 'different' in answer\
+                        or 'explore other' in answer\
+                        or 'not possible' in answer\
+                        or 'does not include' in answer\
+                            or 'elsewhere' in answer:
+                    return True
+            else:
+                False
+        
+        
+        if if_explore(answer):
+            print('in llm explore more!')
+            llm_guide='explore more'
+        elif 'left' in answer:
+            print('in llm left!')
+            obs.semantic=self.render(obs.semantic, 'left')
+            llm_guide='left'
+        elif 'right' in answer:
+            print('in llm right!')
+            obs.semantic=self.render(obs.semantic, 'right')
+            llm_guide='right'
+        elif 'go straight' in answer or 'go forward' in answer:
+            print('in llm foreground!')
+            # foreground is mainly for specific objs such as apple
+            # not suitable for a scene or an area
+            # pure foreground projection shall fail
+            obs.semantic=self.render(obs.semantic, 'foreground')
+            llm_guide='foreground'
+        elif 'straight to the front' in answer:
+            print('in llm background!')
+            # center bottom
+            obs.semantic=self.render(obs.semantic, 'foreground')
+            llm_guide='background'
+
+        return llm_guide
+
+
+    def step(self, observes: Dict, tgt, timestep) -> str:
         print(f'lang tgt now is {tgt}')
-        print('llm_goal_start: ',self.llm_goal_start)
         
         rgb_image = observes['color_sensor'][..., :3][..., ::-1] # (480 640 3)
         
+        # to prevent stuck to the end
+        stuck=False
+        
+        self.history_buffer.append(np.array(self.last_sim_location))
+    
+        if len(self.history_buffer)==6:
+            self.history_buffer.pop(0)            
+            stuck=self.is_stuck(self.history_buffer)
+            
+        if stuck:
+            print("\033[1;36m TURN BACK DETECTED! \033[0m")
+            self.history_buffer=[]
+            self.local_map[:, MC.NON_SEM_CHANNELS+16,:,:]=0
+            self.need_llm=True
+            # clean all, including llm
+            self.local_map[:, MC.NON_SEM_CHANNELS:MC.NON_SEM_CHANNELS+self.num_sem_categories,0,0]=0
+            # just clean specific color.
+            # tgt_id=self.find_corresponding_id(tgt)
+            # self.local_map[:, MC.NON_SEM_CHANNELS+tgt_id,0,0]=0
+
+            
         obs = Observations(
-            gps=[0,0],  ### TODO
-            compass=[0],  ### TODO
+            gps=[0,0],  ### dummy
+            compass=[0],  ### dummy
             rgb=rgb_image,
             depth=observes['depth_sensor'],
             camera_pose=None,
@@ -757,25 +764,15 @@ class NavWithLLM():
 
         obs = self.segmentation.predict(obs)
         
-        self.update_vis(obs,observes['depth_sensor'])
-        
-        llm_guide=None
+        self.update_vis(obs,observes['depth_sensor'])        
         possilbe_llm_stop=False
         
-        
+
         if self.use_llm:
             np_img=np.uint8(rgb_image[:,:,[2,1,0]])
             print("\033[1;31m SHOULD STOP \033[0m")
-            possilbe_llm_stop=self.should_stop(np_img,tgt)
-            if possilbe_llm_stop:
-                if self.last_stop_time is None:
-                    self.last_stop_time=timestep
 
-                if self.last_stop_time+1==timestep:
-                    self.should_stop_accumulation+=1
-                else:
-                    self.should_stop_accumulation=1
-                self.last_stop_time=timestep
+            possilbe_llm_stop=self.should_stop(np_img,tgt)
             
 
             if timestep > self.llm_goal_start+NaviConfig.ENVIRONMENT.llm_endurance: # 5 for debug
@@ -786,66 +783,14 @@ class NavWithLLM():
                 self.llm_goal_start=999
 
             if self.need_llm:
-                question = f'which direction should I go to find {tgt} based on the image? explore more, left, right or straight to the front?'
-                image=Image.fromarray(np_img,'RGB')
-                print("\033[1;31m WHERE \033[0m")
-                answer=self.llm_speak(image,question)
-                print(answer+'\n')  
-                # def convert_direction(answer):
-                #     ans=self.llm_speak(None,f'what is the best option based on this discription: {answer}. Speak only left, right, go straight and see more')
-                #     return ans
-                # direction=convert_direction(answer)
-
-                def if_explore(answer):
-                    if f'no {tgt}' in answer\
-                            or 'does not contain' in answer\
-                                or 'explore further' in answer \
-                                or 'explore more' in answer \
-                                or 'no direct indication' in answer\
-                                or 'different' in answer\
-                                or 'explore other' in answer\
-                                or 'not possible' in answer\
-                                or 'does not include' in answer\
-                                    or 'elsewhere' in answer:
-                            return True
-                    else:
-                        False
-                
-                
-                if if_explore(answer):
-                    # 'see more' in direction:
-                    print('in llm explore more!')
-                    llm_guide='explore more'
-                
-                elif 'left' in answer:
-                    print('in llm left!')
-                    obs.semantic=self.render(obs.semantic, 'left')
-                    llm_guide='left'
-                elif 'right' in answer:
-                    print('in llm right!')
-                    obs.semantic=self.render(obs.semantic, 'right')
-                    llm_guide='right'
-                elif 'go straight' in answer:
-                    print('in llm foreground!')
-                    # foreground is mainly for specific objs such as apple
-                    # not suitable for a scene or an area
-                    # pure foreground projection shall fail
-                    obs.semantic=self.render(obs.semantic, 'foreground')
-                    llm_guide='foreground'
-                elif 'straight to the front' in answer:
-                    print('in llm background!')
-                    # center bottom
-                    obs.semantic=self.render(obs.semantic, 'foreground')
-                    llm_guide='background'
-
-                else:
-                    pass
+                print("\033[1;31m WHERE TO GO \033[0m")
+                # go forward has trouble
+                llm_guide=self.vlm_direction(np_img,tgt,obs)
             else:
-                pass
+                llm_guide='not used'
         else:
-            # debug
+            # debug heuristic rendering
             obs.semantic=self.render(obs.semantic, 'foreground')
-            pass
         
 
         semantic,instances=self.transform_semantic_and_instances(
@@ -863,38 +808,55 @@ class NavWithLLM():
         
         goal_map=None
         look_around=False
-        final_goal=False
+        detect_goal=False
         current_proj=self.local_map[0, 4:4+self.num_sem_categories, :,:].argmax(0)
         
- 
-        if llm_guide=='explore more' :
-            goal_map=self.frontier_goal_map()
-            print('llm frontier point!')
+        
+        
+        tgt_id=self.find_corresponding_id(tgt=tgt)
+        if tgt_id==0:
+            possible_detect_goal=self.local_map[0, 4, :,:]
+        else:
+            possible_detect_goal=(current_proj==(tgt_id)).int()
+        
+        if len(possible_detect_goal.unique())>1:
+            print(f'tat_cat is {NaviConfig.cat2name.get(tgt_id)}')
+            goal_map=possible_detect_goal.cpu().numpy()
+            goal_map=self.cluster_goal_map(goal_map)
+            self.need_llm=False
+            detect_goal=True
+            print('to detection target area!')
         
         else:
-            possible_llm_map=self.local_map[0, MC.NON_SEM_CHANNELS+16, :,:] # llm num is 16
-            possible_llm_map=self.cluster_goal_map(possible_llm_map.cpu().numpy())
-            if isinstance(possible_llm_map,torch.Tensor):
-                possible_llm_map=possible_llm_map.cpu().numpy()
-
-            if len(np.unique(possible_llm_map))>1:
-                self.need_llm=False
-                # llm goal step limitation
-                if self.llm_goal_start == 999:
-                    self.llm_goal_start=timestep
-
-                goal_map=possible_llm_map
-                print('llm point!')
+            if llm_guide=='explore more' :
+                goal_map=self.frontier_goal_map()
+                print('llm assigned frontier!')
+            
             else:
-                self.need_llm=True
-                if self.look_around_step<self.look_around_max_step:
-                    print('fixed look around...')
-                    self.look_around_step+=1
-                    look_around=True
+            
+                possible_llm_map=self.local_map[0, MC.NON_SEM_CHANNELS+16, :,:] # llm num is 16
+                possible_llm_map=self.cluster_goal_map(possible_llm_map.cpu().numpy())
+                if isinstance(possible_llm_map,torch.Tensor):
+                    possible_llm_map=possible_llm_map.cpu().numpy()
+
+                if len(np.unique(possible_llm_map))>1:
+                    self.need_llm=False
+                    # llm goal step limitation
+                    if self.llm_goal_start == 999:
+                        self.llm_goal_start=timestep
+
+                    goal_map=possible_llm_map
+                    print('llm target area!')
                 else:
-                    goal_map=self.frontier_goal_map()
-                    print('frontier point!')
-    
+                    self.need_llm=True
+                    if self.look_around_step<self.look_around_max_step:
+                        print('fixed look around...')
+                        self.look_around_step+=1
+                        look_around=True
+                    else:
+                        goal_map=self.frontier_goal_map()
+                        print('frontier the last!')
+        
         e=0
         obstacle_map=self.local_map[e, 0, :, :].cpu().numpy()
         explored_map=self.local_map[e, 1, :, :].cpu().numpy()
@@ -912,7 +874,7 @@ class NavWithLLM():
         
         if not self.need_llm:
             print('llm planning')
-            action, stg_reached = self._plan(obstacle_map,
+            action, stg_reached,stg = self._plan(obstacle_map,
                                             goal_map,
                                             self.planner_pose_inputs[e])
             print(f'\033[0;33;40mreached short term goal: {stg_reached}\033[0m')
@@ -921,9 +883,17 @@ class NavWithLLM():
                 self.need_llm=True
                 self.llm_goal_start = 999
 
-                # if possilbe_llm_stop:
-                if final_goal or possilbe_llm_stop:
+                if detect_goal and possilbe_llm_stop:
+                    print(f'this is detect goal is { detect_goal}, possilbe_llm_stop is {possilbe_llm_stop}')
                     action='terminate'
+                elif detect_goal and not possilbe_llm_stop:
+                    # chances are the detection goal is wrong
+                    # clean the detection results.
+                    self.local_map[e, MC.NON_SEM_CHANNELS+tgt_id, :, :]=0
+                    # arbitary random go forward, left, right to skip this view point
+                    action=random.choice(['move_forward', 'turn_left', 'turn_right'])
+
+                    
                 print("\033[1;31m cleaning last llm goal! \033[0m")
                 
                 # clean and get new llm guide
@@ -937,13 +907,16 @@ class NavWithLLM():
                 action='turn_right'
             else:
                 print('frontier planning')
-                goal_map=self.frontier_goal_map()
-                action, stg_reached = self._plan(obstacle_map,
+                action, stg_reached,stg = self._plan(obstacle_map,
                                                     goal_map,
-                                                    self.planner_pose_inputs[e])
+                                                    self.planner_pose_inputs[e],
+                                                    )
                 if stg_reached:
                     self.look_around_step=0
             
+        
+        if stuck:
+            action='turn_back'
         print('action:', action)
         self.last_action = action
         
@@ -955,24 +928,47 @@ class NavWithLLM():
                 map_pred=obstacle_map,
                 sem_map_pred=sem_map_pred,
                 tgt=tgt,
-                epi_id=epi_id)
+                )
         
         
-        self.total_timesteps[0] = self.total_timesteps[0] + 1
+        self.time_step = self.time_step + 1
 
         if action == 'terminate':
-            print(f'find {tgt} task is done! spend {self.total_timesteps[0]} steps!')
-            self.reset_sub_episode()
+            print(f'find {tgt} task is done! spend {self.time_step} steps!')
+            self.reset_timestep()
                 
 
-        logging.info("========== total timestep: {} ==========".format(self.total_timesteps))
-        print("======= total timestep: {} =======".format(self.total_timesteps))
+        print(f"======= total timestep: [{self.time_step}] =======")
         
 
         cv2.waitKey(10)
     
         return action
 
+    
+    def find_corresponding_id(self,tgt,rgb_image=None):
+        tgt_cat='initialized'
+        if NaviConfig.name2id.get(tgt) is not None:
+            tgt_id=NaviConfig.name2id.get(tgt)
+            tgt_cat=tgt
+        else:
+            # np_img=np.uint8(rgb_image[:,:,[2,1,0]])
+            # image=Image.fromarray(np_img,'RGB')
+            ans=self.llm_speak(None,
+                            f'In {[name for name in NaviConfig.name2id.keys()]},\
+                                what has the closest meaning to {tgt}, speak only the option')
+            def find_closest_name(ans):
+                for name in NaviConfig.name2id.keys():
+                    if name in ans:
+                        return name
+            
+            while NaviConfig.name2id.get(tgt_cat) is None:
+                tgt_cat=find_closest_name(ans)
+                print(f"closest name {ans} to {tgt}")
+            tgt_id=NaviConfig.name2id.get(tgt_cat)
+        
+        return tgt_id
+    
     def frontier_goal_map(self)->np.array:
         '''
             return ndarray
@@ -980,10 +976,9 @@ class NavWithLLM():
         self.map_features = self.sem_map_module._get_map_features(self.local_map, self.full_map).unsqueeze(1)
         map_features = self.map_features.flatten(0, 1)
         frontier_map = self.policy.get_frontier_map(map_features)
-        self.goal_map = frontier_map
-        self.goal_map=self.goal_map.squeeze(0).squeeze(0)
+        squeezed=frontier_map.squeeze(0).squeeze(0)
         
-        return self.goal_map.cpu().numpy()
+        return squeezed.cpu().numpy()
 
     def record_instance(self,instances,ds):
         instance_ids = np.unique(instances)
@@ -1039,6 +1034,12 @@ class NavWithLLM():
 
         return semantic,instances
     
+    def expand(self,original,rate=NaviConfig.ENVIRONMENT.round_rate-6):
+        selem = skimage.morphology.disk(rate)
+        expanded = skimage.morphology.binary_dilation(
+            original, selem)
+        return expanded
+    
     def downscale(self,obs_rgb,obs_depth,semantic,ds):
         # downscaling rgb, depth, and semantic
         rgb = torch.from_numpy(obs_rgb.copy()).to(self.device)
@@ -1046,7 +1047,7 @@ class NavWithLLM():
         depth = (torch.from_numpy(obs_depth).unsqueeze(-1).to(self.device)) * 100
 
 
-        rgb = np.asarray(self.res(rgb.cpu().numpy().astype(np.uint8)))
+        rgb = np.asarray(self.trans(rgb.cpu().numpy().astype(np.uint8)))
         rgb = torch.tensor(rgb, device=self.device)
         depth = depth[ds // 2::ds, ds // 2::ds]
         semantic = semantic[ds // 2::ds, ds // 2::ds]
@@ -1087,14 +1088,10 @@ class NavWithLLM():
         depth_image = np.repeat(depth_image[..., None].astype(np.uint8),
                                 3,
                                 axis=-1)
-        # for paper vis, this is for seg vis
-        # self.rgb_vis = obs.task_observations["semantic_frame"]
-        self.rgb_vis=obs.rgb
-        agent_view = np.concatenate(
-            [self.rgb_vis, depth_image], axis=1)
+        # seg vis
+        self.rgb_vis = obs.task_observations["semantic_frame"]
+        # self.rgb_vis=obs.rgb
         
-        if NaviConfig.visualize:
-            cv2.imshow('view', agent_view)
 
     
     def cluster_goal_map(self,goal_map) -> None:
@@ -1132,7 +1129,25 @@ if __name__=='__main__':
     sim_settings["scene"] = env_path
     cfg = make_cfg(sim_settings)
     simulator = habitat_sim.Simulator(cfg)
-    goal='some where I can rest'
+    
+    # objects of all kind in hm3d
+        
+    choice=['sofa',
+            'tv_monitor',
+            'bed',
+            'chair',
+            'toilet',
+            'plant',
+            'table',
+            'oven',
+            'sink',
+            'refrigerator',
+            'book',
+            'clock',
+            'vase',
+            'cup',
+            'bottle',]
+    goal=random.choice(choice)
 
 
     agent_traj=[]
@@ -1142,30 +1157,30 @@ if __name__=='__main__':
     # Set agent state
     agent_state = habitat_sim.AgentState()
     agent_traj.append(agent_state.position)
-
-    # start navigation
-    nav_with_llm=NavWithLLM(simulator,device_id=NaviConfig.GPU_ID)
     
-    nav_with_llm.reset(goal)
-    action='turn_right'
+    nav_with_llm=NavWithLLM(simulator)
 
-    max_step=200
+    max_step=400
     step=0
+    stuck=0
+    obs=simulator.reset()
+    nav_with_llm.reset(goal)
+    
     while True:
-        
-        obs=simulator.step(action)
         action=nav_with_llm.step(obs,goal,
-                                       epi_id=999,timestep=step)
-        
+                                    timestep=step)
+        if action=='terminate' or step==max_step:
+            break
+
+        obs=simulator.step(action)
         # record agent state
         agent_state = agent.get_state()
         now_pos=agent_state.position
         agent_traj.append(now_pos)
         step+=1
-
-        if action=='terminate' or step==max_step:
-            break
-
         
+
+    
+    cv2.destroyAllWindows()    
     simulator.close()
     exit()

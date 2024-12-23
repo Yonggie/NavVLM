@@ -5,7 +5,7 @@ class NaviConfig:
     save_images= True
 
     NO_GPU= 0                 # 1: ignore IDs above and run on CPU, 0: run on GPUs with IDs above
-    GPU_ID= 1
+    GPU_ID= 0
     NUM_ENVIRONMENTS= 1      # number of environments (per agent process)
     DUMP_LOCATION= 'datadump'   # path to dump models and log
     matching_etc= 'dummy'       # dummy experiment name
@@ -99,3 +99,24 @@ class NaviConfig:
     coco_full_cat2name={
         0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'
     }
+
+    id2name = {
+        0: 'chair',
+        1: 'couch',
+        2: 'plant',
+        3: 'bed',
+        4: 'toilet',
+        5: 'tv',
+        6: 'table',
+        7: 'oven',
+        8: 'sink',
+        9: 'refrigerator',
+        10: 'book',
+        11: 'clock',
+        12: 'vase',
+        13: 'cup',
+        14: 'bottle',
+        15: 'llm',
+        16: 'other things',
+    }
+    name2id={v:k for k,v in id2name.items()}
